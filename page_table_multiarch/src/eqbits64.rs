@@ -414,6 +414,8 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler, SH: PagingHandler>
             H::alloc_frame()
         };
 
+        debug!("allocated_pt_frame: {:?}", allocated_pt_frame);
+
         if let Some(paddr) = allocated_pt_frame {
             let ptr = H::phys_to_virt(paddr).as_mut_ptr();
             unsafe { core::ptr::write_bytes(ptr, 0, PAGE_SIZE_4K) };

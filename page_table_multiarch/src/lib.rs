@@ -155,7 +155,7 @@ impl From<PageSize> for usize {
 pub struct TlbFlush<M: PagingMetaData>(M::VirtAddr, PhantomData<M>);
 
 impl<M: PagingMetaData> TlbFlush<M> {
-    pub(crate) const fn new(vaddr: M::VirtAddr) -> Self {
+    pub const fn new(vaddr: M::VirtAddr) -> Self {
         Self(vaddr, PhantomData)
     }
 
@@ -177,7 +177,7 @@ impl<M: PagingMetaData> TlbFlush<M> {
 pub struct TlbFlushAll<M: PagingMetaData>(PhantomData<M>);
 
 impl<M: PagingMetaData> TlbFlushAll<M> {
-    pub(crate) const fn new() -> Self {
+    pub const fn new() -> Self {
         Self(PhantomData)
     }
 
