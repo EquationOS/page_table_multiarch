@@ -435,7 +435,7 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler, SH: PagingHandler>
         true
     }
 
-    fn is_root_entry_shared(&self, idx: usize) -> bool {
+    fn is_root_entry_shared(&self, _idx: usize) -> bool {
         true
     }
 
