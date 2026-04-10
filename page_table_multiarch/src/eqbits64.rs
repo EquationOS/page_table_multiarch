@@ -23,10 +23,6 @@ const fn p1_index(vaddr: usize) -> usize {
     (vaddr >> 12) & (ENTRY_COUNT - 1)
 }
 
-/// A generic page table struct for 64-bit platform.
-///
-/// It also tracks all intermediate level tables. They will be deallocated
-/// When the [`EqPageTable64Ext`] itself is dropped.
 pub struct EqPageTable64Ext<
     M: PagingMetaData,
     PTE: GenericPTE,
@@ -34,36 +30,22 @@ pub struct EqPageTable64Ext<
     SH: PagingHandler = H,
 > {
     root_paddr: PhysAddr,
-    /// The private virtual address range for this page table,
-    /// if set, page tables for addresses in this range are private to this page table,
-    /// otherwise, they are shared among multiple page tables.
-    private_vaddr_range: Option<AddrRange<M::VirtAddr>>,
+    /// The managed virtual address range for this page table.
+    managed_vaddr_range: Option<AddrRange<M::VirtAddr>>,
     _phantom: PhantomData<(M, PTE, H, SH)>,
 }
 
 impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler, SH: PagingHandler>
     EqPageTable64Ext<M, PTE, H, SH>
 {
-    // /// Creates a new page table instance or returns the error.
-    // ///
-    // /// It will allocate a new page for the root page table.
-    // pub fn try_new() -> PagingResult<Self> {
-    //     let root_paddr = Self::alloc_table()?;
-    //     Ok(Self {
-    //         root_paddr,
-    //         shared_vaddr_range: None,
-    //         _phantom: PhantomData,
-    //     })
-    // }
-
     pub fn from_paddr(
         root_paddr: PhysAddr,
-        private_vaddr_range: Option<AddrRange<M::VirtAddr>>,
+        managed_vaddr_range: Option<AddrRange<M::VirtAddr>>,
     ) -> PagingResult<Self> {
-        if let Some(range) = &private_vaddr_range {
+        if let Some(range) = &managed_vaddr_range {
             if !range.start.is_aligned(P4E_ADDR_RANGE) || !range.end.is_aligned(P4E_ADDR_RANGE) {
                 error!(
-                    "shared_vaddr_range {:?} is not aligned to {:#x}",
+                    "managed_vaddr_range {:?} is not aligned to {:#x}",
                     range, P4E_ADDR_RANGE
                 );
                 return Err(PagingError::NotAligned);
@@ -72,7 +54,7 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler, SH: PagingHandler>
 
         Ok(Self {
             root_paddr,
-            private_vaddr_range,
+            managed_vaddr_range,
             _phantom: PhantomData,
         })
     }
@@ -98,6 +80,7 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler, SH: PagingHandler>
         page_size: PageSize,
         flags: MappingFlags,
     ) -> PagingResult<TlbFlush<M>> {
+        self.ensure_supported_vaddr(vaddr)?;
         let entry = self.get_entry_mut_or_create(vaddr, page_size)?;
         if !entry.is_unused() {
             return Err(PagingError::AlreadyMapped);
@@ -119,6 +102,7 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler, SH: PagingHandler>
         paddr: PhysAddr,
         flags: MappingFlags,
     ) -> PagingResult<(PageSize, TlbFlush<M>)> {
+        self.ensure_supported_vaddr(vaddr)?;
         let (entry, size) = self.get_entry_mut(vaddr)?;
         entry.set_paddr(paddr);
         entry.set_flags(flags, size.is_huge());
@@ -136,6 +120,7 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler, SH: PagingHandler>
         vaddr: M::VirtAddr,
         flags: MappingFlags,
     ) -> PagingResult<(PageSize, TlbFlush<M>)> {
+        self.ensure_supported_vaddr(vaddr)?;
         let (entry, size) = self.get_entry_mut(vaddr)?;
         if !entry.is_present() {
             return Err(PagingError::NotMapped);
@@ -149,6 +134,7 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler, SH: PagingHandler>
     /// Returns [`Err(PagingError::NotMapped)`](PagingError::NotMapped) if the
     /// mapping is not present.
     pub fn unmap(&mut self, vaddr: M::VirtAddr) -> PagingResult<(PhysAddr, PageSize, TlbFlush<M>)> {
+        self.ensure_supported_vaddr(vaddr)?;
         let (entry, size, pt_frame) = self.get_entry_pt_mut(vaddr)?;
         if !entry.is_present() {
             entry.clear();
@@ -177,6 +163,7 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler, SH: PagingHandler>
     /// Returns [`Err(PagingError::NotMapped)`](PagingError::NotMapped) if the
     /// mapping is not present.
     pub fn query(&self, vaddr: M::VirtAddr) -> PagingResult<(PhysAddr, MappingFlags, PageSize)> {
+        self.ensure_supported_vaddr(vaddr)?;
         let (entry, size) = self.get_entry(vaddr)?;
         if entry.is_unused() {
             return Err(PagingError::NotMapped);
@@ -213,6 +200,7 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler, SH: PagingHandler>
         if !PageSize::Size4K.is_aligned(vaddr_usize) || !PageSize::Size4K.is_aligned(size) {
             return Err(PagingError::NotAligned);
         }
+        self.ensure_supported_vaddr_range(vaddr, size)?;
         trace!(
             "map_region({:#x}): [{:#x}, {:#x}) {:?}",
             self.root_paddr(),
@@ -276,6 +264,7 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler, SH: PagingHandler>
     ) -> PagingResult<TlbFlushAll<M>> {
         let mut vaddr_usize: usize = vaddr.into();
         let mut size = size;
+        self.ensure_supported_vaddr_range(vaddr, size)?;
         trace!(
             "unmap_region({:#x}) [{:#x}, {:#x})",
             self.root_paddr(),
@@ -317,6 +306,7 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler, SH: PagingHandler>
     ) -> PagingResult<TlbFlushAll<M>> {
         let mut vaddr_usize: usize = vaddr.into();
         let mut size = size;
+        self.ensure_supported_vaddr_range(vaddr, size)?;
         trace!(
             "protect_region({:#x}) [{:#x}, {:#x}) {:?}",
             self.root_paddr(),
@@ -407,6 +397,48 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler, SH: PagingHandler>
 impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler, SH: PagingHandler>
     EqPageTable64Ext<M, PTE, H, SH>
 {
+    fn is_in_managed_vaddr_range(&self, vaddr: M::VirtAddr) -> bool {
+        self.managed_vaddr_range
+            .as_ref()
+            .is_some_and(|range| range.contains(vaddr))
+    }
+
+    fn ensure_supported_vaddr(&self, vaddr: M::VirtAddr) -> PagingResult<()> {
+        if self.managed_vaddr_range.is_some() && !self.is_in_managed_vaddr_range(vaddr) {
+            error!(
+                "vaddr {:#x?} is out of managed_vaddr_range {:?}",
+                vaddr, self.managed_vaddr_range
+            );
+            return Err(PagingError::NotMapped);
+        }
+        Ok(())
+    }
+
+    fn ensure_supported_vaddr_range(&self, start: M::VirtAddr, size: usize) -> PagingResult<()> {
+        if let Some(range) = &self.managed_vaddr_range {
+            let req = AddrRange::from_start_size(start, size);
+            if !range.contains_range(req) {
+                error!(
+                    "vaddr range [{:#x?}~{:#x?}] is out of managed_vaddr_range {:?}",
+                    start,
+                    start.add(size),
+                    self.managed_vaddr_range
+                );
+                return Err(PagingError::NotMapped);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn uses_shared_pt_for_vaddr(&self, _vaddr: M::VirtAddr) -> bool {
+        true
+    }
+
+    fn is_root_entry_shared(&self, idx: usize) -> bool {
+        true
+    }
+
     fn alloc_table(shared_pt: bool) -> PagingResult<PhysAddr> {
         let allocated_pt_frame = if shared_pt {
             SH::alloc_frame()
@@ -414,10 +446,12 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler, SH: PagingHandler>
             H::alloc_frame()
         };
 
-        debug!("allocated_pt_frame: {:?}", allocated_pt_frame);
-
         if let Some(paddr) = allocated_pt_frame {
-            let ptr = H::phys_to_virt(paddr).as_mut_ptr();
+            let ptr: *mut u8 = if shared_pt {
+                SH::phys_to_virt(paddr).as_mut_ptr()
+            } else {
+                H::phys_to_virt(paddr).as_mut_ptr()
+            };
             unsafe { core::ptr::write_bytes(ptr, 0, PAGE_SIZE_4K) };
             Ok(paddr)
         } else {
@@ -568,20 +602,29 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler, SH: PagingHandler>
         Ok((p1e, PageSize::Size4K, p2e.paddr()))
     }
 
+    fn dealloc_tree(&self, table_paddr: PhysAddr, level: usize, shared_pt: bool) {
+        if level < M::LEVELS - 1 {
+            for entry in self.table_of(table_paddr) {
+                if self.next_table(entry).is_ok() {
+                    self.dealloc_tree(entry.paddr(), level + 1, shared_pt);
+                }
+            }
+        }
+
+        if shared_pt {
+            SH::dealloc_frame(table_paddr);
+        } else {
+            H::dealloc_frame(table_paddr);
+        }
+    }
+
     fn get_entry_mut_or_create(
         &mut self,
         vaddr: M::VirtAddr,
         page_size: PageSize,
     ) -> PagingResult<&mut PTE> {
-        let shared_pt = if let Some(range) = &self.private_vaddr_range {
-            // For vaddrs outside the private_vaddr_range, use shared mapping, which is visiable for
-            // all processes in this instance.
-            // Otherwise, use private page tables.
-            !range.contains(vaddr)
-        } else {
-            // no private_vaddr_range is set, all page tables are treated as private
-            false
-        };
+        self.ensure_supported_vaddr(vaddr)?;
+        let shared_pt = self.uses_shared_pt_for_vaddr(vaddr);
 
         let vaddr: usize = vaddr.into();
 
@@ -658,16 +701,12 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler, SH: PagingHandler> Dr
             self.root_paddr()
         );
 
-        // don't free the entries in last level, they are not array.
-        let _ = self.walk(
-            usize::MAX,
-            None,
-            Some(&|level, _index, _vaddr, entry: &PTE| {
-                if level < M::LEVELS - 1 && entry.is_present() && !entry.is_huge() {
-                    H::dealloc_frame(entry.paddr());
-                }
-            }),
-        );
+        let root = self.table_of(self.root_paddr);
+        for (i, entry) in root.iter().enumerate() {
+            if self.next_table(entry).is_ok() {
+                self.dealloc_tree(entry.paddr(), 1, self.is_root_entry_shared(i));
+            }
+        }
         H::dealloc_frame(self.root_paddr());
     }
 }
