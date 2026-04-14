@@ -391,6 +391,72 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler, SH: PagingHandler>
         assert!(end_idx <= ENTRY_COUNT);
         dst_table[start_idx..end_idx].copy_from_slice(&src_table[start_idx..end_idx]);
     }
+
+    pub fn copy_page_range_from(
+        &mut self,
+        src: &mut Self,
+        start: M::VirtAddr,
+        size: usize,
+    ) -> PagingResult<()> {
+        debug!(
+            "EqPT [@{:?}] copy_page_range_from [@{:?}]: [{:#x?}~{:#x?}], size {:#x}",
+            self.root_paddr(),
+            src.root_paddr(),
+            start,
+            start.add(size),
+            size
+        );
+
+        if size == 0 {
+            return Ok(());
+        }
+
+        self.ensure_supported_vaddr_range(start, size)?;
+        src.ensure_supported_vaddr_range(start, size)?;
+
+        let mut vaddr_usize: usize = start.into();
+        let end = vaddr_usize + size;
+
+        while vaddr_usize < end {
+            let vaddr: M::VirtAddr = vaddr_usize.into();
+            match src.query(vaddr) {
+                Ok((paddr, flags, page_size)) => {
+                    let mut map_flags = flags;
+                    if map_flags.contains(MappingFlags::WRITE) {
+                        map_flags.remove(MappingFlags::WRITE);
+                        let (_pgsize, tlb) = src.protect(vaddr, map_flags)?;
+                        tlb.flush();
+                    }
+
+                    match self.query(vaddr) {
+                        Ok((_existing_paddr, _existing_flags, _existing_size)) => {
+                            let (_pgsize, tlb) = self.protect(vaddr, map_flags)?;
+                            tlb.flush();
+                        }
+                        Err(PagingError::NotMapped) => {
+                            let tlb = self.map(vaddr, paddr, page_size, map_flags)?;
+                            tlb.flush();
+                        }
+                        Err(err) => return Err(err),
+                    }
+
+                    // Parent and child now share this leaf backing. The leaf
+                    // lifetime is managed outside the page-table allocator, so
+                    // explicitly bump the data-frame refcount here.
+                    H::inc_frame_ref(paddr);
+
+                    let next = vaddr.align_down(page_size).add(page_size.into());
+                    vaddr_usize = next.into();
+                }
+                Err(PagingError::NotMapped) => {
+                    vaddr_usize += PAGE_SIZE_4K;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(())
+    }
 }
 
 // Private implements.

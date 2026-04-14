@@ -104,6 +104,13 @@ pub trait PagingHandler: Sized {
         }
     }
 
+    /// Increments the reference count of a mapped data frame when a leaf entry
+    /// is shared into another page table, such as during fork-based COW setup.
+    ///
+    /// The default implementation is a no-op because not every paging handler
+    /// needs to manage leaf-frame lifetime.
+    fn inc_frame_ref(_paddr: PhysAddr) {}
+
     /// Returns a virtual address that maps to the given physical address.
     ///
     /// Used to access the physical memory directly in page table implementation.
