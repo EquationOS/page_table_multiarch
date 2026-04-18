@@ -429,7 +429,12 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler, SH: PagingHandler>
                     }
 
                     match self.query(vaddr) {
-                        Ok((_existing_paddr, _existing_flags, _existing_size)) => {
+                        Ok((existing_paddr, existing_flags, existing_size)) => {
+                            warn!(
+                                "{:#x?} already map to {:#x?}, flags {:?}, {:?}, just protect it",
+                                vaddr, existing_paddr, existing_flags, existing_size,
+                            );
+
                             let (_pgsize, tlb) = self.protect(vaddr, map_flags)?;
                             tlb.flush();
                         }
