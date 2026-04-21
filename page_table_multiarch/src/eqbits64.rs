@@ -1,7 +1,7 @@
 use crate::{GenericPTE, PagingHandler, PagingMetaData};
 use crate::{MappingFlags, PageSize, PagingError, PagingResult, TlbFlush, TlbFlushAll};
 use core::marker::PhantomData;
-use memory_addr::{AddrRange, MemoryAddr, PAGE_SIZE_4K, PhysAddr};
+use memory_addr::{AddrRange, MemoryAddr, PhysAddr, PAGE_SIZE_4K};
 
 const ENTRY_COUNT: usize = 512;
 
@@ -135,22 +135,22 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler, SH: PagingHandler>
     /// mapping is not present.
     pub fn unmap(&mut self, vaddr: M::VirtAddr) -> PagingResult<(PhysAddr, PageSize, TlbFlush<M>)> {
         self.ensure_supported_vaddr(vaddr)?;
-        let (entry, size, pt_frame) = self.get_entry_pt_mut(vaddr)?;
+        let (entry, size, _pt_frame) = self.get_entry_pt_mut(vaddr)?;
         if !entry.is_present() {
             entry.clear();
             return Err(PagingError::NotMapped);
         }
         let paddr = entry.paddr();
         entry.clear();
-
-        if self.next_page_table_is_empty(pt_frame) {
-            debug!(
-                "Next level PT {:#x} is empty after unmapping vaddr {:#x}",
-                pt_frame, vaddr
-            );
-            // Next level PT is empty after unmapping, we shoule dealloc it.
-            // H::dealloc_frame(pt_frame);
-        }
+        self.unmap_region_recursive(
+            self.root_paddr(),
+            0,
+            0,
+            vaddr.into(),
+            vaddr.into() + size as usize,
+            false,
+            &mut |_paddr, _page_size| {},
+        )?;
 
         Ok((paddr, size, TlbFlush::new(vaddr)))
     }
@@ -262,8 +262,10 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler, SH: PagingHandler>
         size: usize,
         flush_tlb_by_page: bool,
     ) -> PagingResult<TlbFlushAll<M>> {
-        let mut vaddr_usize: usize = vaddr.into();
-        let mut size = size;
+        let vaddr_usize: usize = vaddr.into();
+        if !PageSize::Size4K.is_aligned(vaddr_usize) || !PageSize::Size4K.is_aligned(size) {
+            return Err(PagingError::NotAligned);
+        }
         self.ensure_supported_vaddr_range(vaddr, size)?;
         trace!(
             "unmap_region({:#x}) [{:#x}, {:#x})",
@@ -271,22 +273,48 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler, SH: PagingHandler>
             vaddr_usize,
             vaddr_usize + size,
         );
-        while size > 0 {
-            let vaddr = vaddr_usize.into();
-            let (_, page_size, tlb) = self
-                .unmap(vaddr)
-                .inspect_err(|e| error!("failed to unmap page: {:#x?}, {:?}", vaddr_usize, e))?;
-            if flush_tlb_by_page {
-                tlb.flush();
-            } else {
-                tlb.ignore();
-            }
+        self.unmap_region_recursive(
+            self.root_paddr(),
+            0,
+            0,
+            vaddr_usize,
+            vaddr_usize + size,
+            flush_tlb_by_page,
+            &mut |_paddr, _page_size| {},
+        )?;
+        Ok(TlbFlushAll::new())
+    }
 
-            assert!(page_size.is_aligned(vaddr_usize));
-            assert!(page_size as usize <= size);
-            vaddr_usize += page_size as usize;
-            size -= page_size as usize;
+    pub fn unmap_region_with<F>(
+        &mut self,
+        vaddr: M::VirtAddr,
+        size: usize,
+        flush_tlb_by_page: bool,
+        mut on_unmap: F,
+    ) -> PagingResult<TlbFlushAll<M>>
+    where
+        F: FnMut(PhysAddr, PageSize),
+    {
+        let vaddr_usize: usize = vaddr.into();
+        if !PageSize::Size4K.is_aligned(vaddr_usize) || !PageSize::Size4K.is_aligned(size) {
+            return Err(PagingError::NotAligned);
         }
+        self.ensure_supported_vaddr_range(vaddr, size)?;
+        trace!(
+            "unmap_region_with({:#x}) [{:#x}, {:#x})",
+            self.root_paddr(),
+            vaddr_usize,
+            vaddr_usize + size,
+        );
+        self.unmap_region_recursive(
+            self.root_paddr(),
+            0,
+            0,
+            vaddr_usize,
+            vaddr_usize + size,
+            flush_tlb_by_page,
+            &mut on_unmap,
+        )?;
         Ok(TlbFlushAll::new())
     }
 
@@ -640,6 +668,104 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler, SH: PagingHandler>
             }
         }
         true
+    }
+
+    fn dealloc_pt_frame(&self, pt: PhysAddr, shared_pt: bool) {
+        if shared_pt {
+            SH::dealloc_frame(pt);
+        } else {
+            H::dealloc_frame(pt);
+        }
+    }
+
+    fn level_page_size(level: usize) -> PageSize {
+        match M::LEVELS - 1 - level {
+            0 => PageSize::Size4K,
+            1 => PageSize::Size2M,
+            2 => PageSize::Size1G,
+            _ => unreachable!(),
+        }
+    }
+
+    fn entry_span(level: usize) -> usize {
+        1usize << (12 + (M::LEVELS - 1 - level) * 9)
+    }
+
+    fn entry_index(level: usize, vaddr: usize) -> usize {
+        match M::LEVELS - 1 - level {
+            0 => p1_index(vaddr),
+            1 => p2_index(vaddr),
+            2 => p3_index(vaddr),
+            3 => p4_index(vaddr),
+            _ => unreachable!(),
+        }
+    }
+
+    fn unmap_region_recursive<F>(
+        &mut self,
+        table_paddr: PhysAddr,
+        level: usize,
+        table_base: usize,
+        start: usize,
+        end: usize,
+        flush_tlb_by_page: bool,
+        on_unmap: &mut F,
+    ) -> PagingResult<bool>
+    where
+        F: FnMut(PhysAddr, PageSize),
+    {
+        let span = Self::entry_span(level);
+        let start_idx = Self::entry_index(level, start);
+        let end_idx = Self::entry_index(level, end - 1) + 1;
+
+        for idx in start_idx..end_idx {
+            let entry_base = table_base + idx * span;
+            let range_start = start.max(entry_base);
+            let range_end = end.min(entry_base + span);
+            if range_start >= range_end {
+                continue;
+            }
+
+            let entry = self.table_of(table_paddr)[idx];
+            if entry.is_unused() {
+                continue;
+            }
+
+            if level == M::LEVELS - 1 || entry.is_huge() {
+                let page_size = Self::level_page_size(level);
+                if range_start != entry_base || range_end != entry_base + page_size as usize {
+                    return Err(PagingError::MappedToHugePage);
+                }
+
+                let paddr = entry.paddr();
+                let table = self.table_of_mut(table_paddr);
+                table[idx].clear();
+                if flush_tlb_by_page {
+                    M::flush_tlb(Some(entry_base.into()));
+                }
+                on_unmap(paddr, page_size);
+                continue;
+            }
+
+            let child_paddr = entry.paddr();
+            let child_empty = self.unmap_region_recursive(
+                child_paddr,
+                level + 1,
+                entry_base,
+                range_start,
+                range_end,
+                flush_tlb_by_page,
+                on_unmap,
+            )?;
+            if child_empty {
+                let shared_pt = self.uses_shared_pt_for_vaddr(entry_base.into());
+                self.dealloc_pt_frame(child_paddr, shared_pt);
+                let table = self.table_of_mut(table_paddr);
+                table[idx].clear();
+            }
+        }
+
+        Ok(self.next_page_table_is_empty(table_paddr))
     }
 
     /// Only used in unmap to get the page table frame that may be freed.
