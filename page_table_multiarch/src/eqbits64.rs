@@ -442,53 +442,17 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler, SH: PagingHandler>
         self.ensure_supported_vaddr_range(start, size)?;
         src.ensure_supported_vaddr_range(start, size)?;
 
-        let mut vaddr_usize: usize = start.into();
-        let end = vaddr_usize + size;
-
-        while vaddr_usize < end {
-            let vaddr: M::VirtAddr = vaddr_usize.into();
-            match src.query(vaddr) {
-                Ok((paddr, flags, page_size)) => {
-                    let mut map_flags = flags;
-                    if map_flags.contains(MappingFlags::WRITE) {
-                        map_flags.remove(MappingFlags::WRITE);
-                        let (_pgsize, tlb) = src.protect(vaddr, map_flags)?;
-                        tlb.flush();
-                    }
-
-                    match self.query(vaddr) {
-                        Ok((existing_paddr, existing_flags, existing_size)) => {
-                            warn!(
-                                "{:#x?} already map to {:#x?}, flags {:?}, {:?}, just protect it",
-                                vaddr, existing_paddr, existing_flags, existing_size,
-                            );
-
-                            let (_pgsize, tlb) = self.protect(vaddr, map_flags)?;
-                            tlb.flush();
-                        }
-                        Err(PagingError::NotMapped) => {
-                            let tlb = self.map(vaddr, paddr, page_size, map_flags)?;
-                            tlb.flush();
-                        }
-                        Err(err) => return Err(err),
-                    }
-
-                    // Parent and child now share this leaf backing. The leaf
-                    // lifetime is managed outside the page-table allocator, so
-                    // explicitly bump the data-frame refcount here.
-                    H::inc_frame_ref(paddr);
-
-                    let next = vaddr.align_down(page_size).add(page_size.into());
-                    vaddr_usize = next.into();
-                }
-                Err(PagingError::NotMapped) => {
-                    vaddr_usize += PAGE_SIZE_4K;
-                }
-                Err(err) => return Err(err),
-            }
-        }
-
-        Ok(())
+        let start_usize: usize = start.into();
+        let end = start_usize + size;
+        self.copy_page_range_recursive(
+            src,
+            self.root_paddr(),
+            src.root_paddr(),
+            0,
+            0,
+            start_usize,
+            end,
+        )
     }
 }
 
@@ -699,6 +663,177 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler, SH: PagingHandler>
             3 => p4_index(vaddr),
             _ => unreachable!(),
         }
+    }
+
+    /// Slow but straightforward leaf-by-leaf copy path used as a correctness
+    /// fallback when the fast recursive copier encounters a pre-existing
+    /// destination shape that should be preserved. The common fork path builds
+    /// a fresh child root, so the fast path handles almost everything.
+    fn copy_page_range_slow(
+        &mut self,
+        src: &mut Self,
+        start: usize,
+        end: usize,
+    ) -> PagingResult<()> {
+        let mut vaddr_usize = start;
+
+        while vaddr_usize < end {
+            let vaddr: M::VirtAddr = vaddr_usize.into();
+            match src.query(vaddr) {
+                Ok((paddr, flags, page_size)) => {
+                    let mut map_flags = flags;
+                    if map_flags.contains(MappingFlags::WRITE) {
+                        map_flags.remove(MappingFlags::WRITE);
+                        let (_pgsize, tlb) = src.protect(vaddr, map_flags)?;
+                        tlb.flush();
+                    }
+
+                    match self.query(vaddr) {
+                        Ok((existing_paddr, existing_flags, existing_size)) => {
+                            warn!(
+                                "{:#x?} already map to {:#x?}, flags {:?}, {:?}, just protect it",
+                                vaddr, existing_paddr, existing_flags, existing_size,
+                            );
+
+                            let (_pgsize, tlb) = self.protect(vaddr, map_flags)?;
+                            tlb.flush();
+                        }
+                        Err(PagingError::NotMapped) => {
+                            let tlb = self.map(vaddr, paddr, page_size, map_flags)?;
+                            tlb.flush();
+                        }
+                        Err(err) => return Err(err),
+                    }
+
+                    H::inc_frame_ref(paddr);
+
+                    let next = vaddr.align_down(page_size).add(page_size.into());
+                    vaddr_usize = next.into();
+                }
+                Err(PagingError::NotMapped) => {
+                    vaddr_usize += PAGE_SIZE_4K;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(())
+    }
+
+    fn copy_page_range_recursive(
+        &mut self,
+        src: &mut Self,
+        dst_table_paddr: PhysAddr,
+        src_table_paddr: PhysAddr,
+        level: usize,
+        table_base: usize,
+        start: usize,
+        end: usize,
+    ) -> PagingResult<()> {
+        let span = Self::entry_span(level);
+        let start_idx = Self::entry_index(level, start);
+        let end_idx = Self::entry_index(level, end - 1) + 1;
+
+        for idx in start_idx..end_idx {
+            let entry_base = table_base + idx * span;
+            let range_start = start.max(entry_base);
+            let range_end = end.min(entry_base + span);
+            if range_start >= range_end {
+                continue;
+            }
+
+            let src_entry = src.table_of(src_table_paddr)[idx];
+            if src_entry.is_unused() {
+                continue;
+            }
+
+            if level == M::LEVELS - 1 || src_entry.is_huge() {
+                self.copy_leaf_entry_from(
+                    src,
+                    dst_table_paddr,
+                    src_table_paddr,
+                    level,
+                    idx,
+                    entry_base,
+                )?;
+                continue;
+            }
+
+            let dst_entry = self.table_of(dst_table_paddr)[idx];
+            if dst_entry.is_huge() {
+                // The common fork path should not hit this. Fall back to the
+                // old per-leaf logic so mixed destination shapes keep their
+                // previous semantics instead of inventing a new remap rule.
+                self.copy_page_range_slow(src, range_start, range_end)?;
+                continue;
+            }
+
+            let child_dst_paddr = if dst_entry.is_unused() {
+                let shared_pt = self.uses_shared_pt_for_vaddr(entry_base.into());
+                let child_paddr = Self::alloc_table(shared_pt)?;
+                let table = self.table_of_mut(dst_table_paddr);
+                table[idx] = GenericPTE::new_table(child_paddr);
+                child_paddr
+            } else {
+                dst_entry.paddr()
+            };
+
+            self.copy_page_range_recursive(
+                src,
+                child_dst_paddr,
+                src_entry.paddr(),
+                level + 1,
+                entry_base,
+                range_start,
+                range_end,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn copy_leaf_entry_from(
+        &mut self,
+        src: &mut Self,
+        dst_table_paddr: PhysAddr,
+        src_table_paddr: PhysAddr,
+        level: usize,
+        idx: usize,
+        entry_base: usize,
+    ) -> PagingResult<()> {
+        let src_entry = src.table_of(src_table_paddr)[idx];
+        let page_size = Self::level_page_size(level);
+        let paddr = src_entry.paddr();
+        let mut map_flags = src_entry.flags();
+
+        // Fork establishes COW by downgrading the parent's writable leaf once,
+        // directly in the source table, instead of re-walking the page table
+        // through protect() for every page in the range.
+        if map_flags.contains(MappingFlags::WRITE) {
+            map_flags.remove(MappingFlags::WRITE);
+            let src_table = src.table_of_mut(src_table_paddr);
+            src_table[idx].set_flags(map_flags, page_size.is_huge());
+            M::flush_tlb(Some(entry_base.into()));
+        }
+
+        let dst_entry = self.table_of(dst_table_paddr)[idx];
+        if dst_entry.is_unused() {
+            let dst_table = self.table_of_mut(dst_table_paddr);
+            dst_table[idx] =
+                GenericPTE::new_page(paddr.align_down(page_size), map_flags, page_size.is_huge());
+        } else {
+            // Preserve the existing collision behavior for the rare case where
+            // the destination already contains mappings in this range.
+            self.copy_page_range_slow(src, entry_base, entry_base + page_size as usize)?;
+            return Ok(());
+        }
+
+        // Parent and child now share this leaf backing. The leaf lifetime is
+        // managed outside the page-table allocator, so explicitly bump the
+        // data-frame refcount once per copied leaf.
+        H::inc_frame_ref(paddr);
+
+        Ok(())
     }
 
     fn unmap_region_recursive<F>(
