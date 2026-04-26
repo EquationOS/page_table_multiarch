@@ -58,20 +58,45 @@ pub struct X64PTE(u64);
 
 impl X64PTE {
     const PHYS_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000; // bits 12..52
+    const PKEY_SHIFT: u64 = 59;
+    const PKEY_MASK: u64 = 0b1111 << Self::PKEY_SHIFT;
+    const LIBOS_PKEY: u64 = 1;
 
     /// Creates an empty descriptor with all bits set to zero.
     pub const fn empty() -> Self {
         Self(0)
     }
+
+    #[inline]
+    fn pkey_bits_from_flags(flags: MappingFlags) -> u64 {
+        if flags.contains(MappingFlags::PKEY_LIBOS) {
+            Self::LIBOS_PKEY << Self::PKEY_SHIFT
+        } else {
+            0
+        }
+    }
+
+    #[inline]
+    fn flags_from_raw(raw: u64) -> MappingFlags {
+        let mut flags: MappingFlags = PTF::from_bits_truncate(raw).into();
+        if ((raw & Self::PKEY_MASK) >> Self::PKEY_SHIFT) == Self::LIBOS_PKEY {
+            flags |= MappingFlags::PKEY_LIBOS;
+        }
+        flags
+    }
 }
 
 impl GenericPTE for X64PTE {
     fn new_page(paddr: PhysAddr, flags: MappingFlags, is_huge: bool) -> Self {
-        let mut flags = PTF::from(flags);
+        let mut ptf = PTF::from(flags);
         if is_huge {
-            flags |= PTF::HUGE_PAGE;
+            ptf |= PTF::HUGE_PAGE;
         }
-        Self(flags.bits() | (paddr.as_usize() as u64 & Self::PHYS_ADDR_MASK))
+        Self(
+            ptf.bits()
+                | (paddr.as_usize() as u64 & Self::PHYS_ADDR_MASK)
+                | Self::pkey_bits_from_flags(flags),
+        )
     }
     fn new_table(paddr: PhysAddr) -> Self {
         let flags = PTF::PRESENT | PTF::WRITABLE | PTF::USER_ACCESSIBLE;
@@ -81,17 +106,20 @@ impl GenericPTE for X64PTE {
         PhysAddr::from((self.0 & Self::PHYS_ADDR_MASK) as usize)
     }
     fn flags(&self) -> MappingFlags {
-        PTF::from_bits_truncate(self.0).into()
+        Self::flags_from_raw(self.0)
     }
     fn set_paddr(&mut self, paddr: PhysAddr) {
         self.0 = (self.0 & !Self::PHYS_ADDR_MASK) | (paddr.as_usize() as u64 & Self::PHYS_ADDR_MASK)
     }
     fn set_flags(&mut self, flags: MappingFlags, is_huge: bool) {
-        let mut flags = PTF::from(flags);
+        let mut ptf = PTF::from(flags);
         if is_huge {
-            flags |= PTF::HUGE_PAGE;
+            ptf |= PTF::HUGE_PAGE;
         }
-        self.0 = (self.0 & Self::PHYS_ADDR_MASK) | flags.bits()
+        self.0 = (self.0 & Self::PHYS_ADDR_MASK)
+            | (self.paddr().as_usize() as u64 & Self::PHYS_ADDR_MASK)
+            | ptf.bits()
+            | Self::pkey_bits_from_flags(flags)
     }
 
     fn bits(self) -> usize {

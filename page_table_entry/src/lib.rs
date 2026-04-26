@@ -26,6 +26,11 @@ bitflags::bitflags! {
         const DEVICE        = 1 << 4;
         /// The memory is uncached.
         const UNCACHED      = 1 << 5;
+        /// This mapping belongs to Junction/LibOS privileged user-space memory
+        /// and should be encoded with a non-default x86 protection key.
+        ///
+        /// The bit is ignored on architectures that do not support MPK/PKU.
+        const PKEY_LIBOS    = 1 << 16;
     }
 }
 
