@@ -1,3 +1,5 @@
 /target
 /.vscode
 .DS_Store
+rustc-ice-*.txt
+*/rustc-ice-*.txt
