@@ -135,6 +135,19 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler, SH: PagingHandler>
     /// mapping is not present.
     pub fn unmap(&mut self, vaddr: M::VirtAddr) -> PagingResult<(PhysAddr, PageSize, TlbFlush<M>)> {
         self.ensure_supported_vaddr(vaddr)?;
+        self.unmap_without_vaddr_check(vaddr)
+    }
+
+    /// Unmaps one page-table entry without applying the managed-range guard.
+    ///
+    /// This is intended for supervisor/runtime mappings that are installed
+    /// outside the normal managed user range. It only clears the page-table
+    /// entry and returns the mapped frame; callers remain responsible for any
+    /// metadata updates, frame lifetime, and TLB/EPT invalidation.
+    pub fn unmap_without_vaddr_check(
+        &mut self,
+        vaddr: M::VirtAddr,
+    ) -> PagingResult<(PhysAddr, PageSize, TlbFlush<M>)> {
         let (entry, size, _pt_frame) = self.get_entry_pt_mut(vaddr)?;
         if !entry.is_present() {
             entry.clear();
